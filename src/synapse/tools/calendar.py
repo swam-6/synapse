@@ -33,17 +33,54 @@ class CreateEventInput(BaseModel):
 
 
 class DeleteEventInput(BaseModel):
-    """Validated arguments for deleting a calendar event.
+    """Validated arguments for deleting a calendar event."""
 
-    The event is identified by title and start time rather than by id: ids are
-    deliberately never exposed to the agent, so it cannot read them out to the
-    user or invent one.
-    """
-
+    # Identified by title + start rather than by id: ids are deliberately never
+    # exposed to the agent, so it cannot read one out to the user or invent one.
+    # (Kept as a comment, not a docstring — the docstring is billed as schema
+    # text on every agent call, and this rationale is for us, not the model.)
     summary: str = Field(min_length=1, description="Title of the event to delete.")
-    start: str = Field(
-        description="Start time of the event to delete, as an ISO 8601 string."
-    )
+    start: str = Field(description="Start time of the event, ISO 8601.")
+
+
+#: Named spans ``list_events`` can resolve itself, so the agent needs no date
+#: arithmetic (and no get_current_datetime round trip) for the common listings.
+_PERIOD_CHOICES = ("today", "tomorrow", "yesterday", "this_week", "next_week")
+
+
+def _resolve_period(period: str, user_tz: tzinfo) -> tuple[datetime, datetime] | None:
+    """Resolve a named period into a local ``[start, end]`` window.
+
+    Models routinely get date arithmetic wrong — reporting today's date as
+    "tomorrow", or attaching a UTC offset to a local wall-clock time — and a
+    wrong window silently returns the wrong events. Resolving the span here
+    removes that whole class of error: the agent names the period, the server
+    computes the dates in the user's timezone.
+
+    Returns ``None`` for an unrecognised name so the caller can report the
+    valid choices rather than guessing at one.
+    """
+    key = period.strip().lower().replace(" ", "_").replace("-", "_")
+    midnight = datetime.now(user_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def end_of(day: datetime) -> datetime:
+        return day.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    if key == "today":
+        return midnight, end_of(midnight)
+    if key == "tomorrow":
+        day = midnight + timedelta(days=1)
+        return day, end_of(day)
+    if key == "yesterday":
+        day = midnight - timedelta(days=1)
+        return day, end_of(day)
+    if key in {"this_week", "week"}:
+        # Seven days inclusive of today, matching the agent prompt's definition.
+        return midnight, end_of(midnight + timedelta(days=6))
+    if key == "next_week":
+        start = midnight + timedelta(days=7)
+        return start, end_of(start + timedelta(days=6))
+    return None
 
 
 def _is_all_day(value: str) -> bool:
@@ -157,13 +194,7 @@ def build_calendar_tools(
 
     @tool
     async def get_current_datetime() -> str:
-        """Return the current local date/time plus the resolved relative dates.
-
-        Call this first whenever the request involves a relative date or time
-        (today, tomorrow, yesterday, this week, "in 2 hours"). Use the dates it
-        reports verbatim — they are already calculated, so you must not do any
-        date arithmetic yourself.
-        """
+        """Return current local date/time + relative dates (today, tomorrow, yesterday). Call FIRST for date/time requests."""
         now = datetime.now(user_tz)
         offset = now.strftime("%z")
         offset = f"{offset[:3]}:{offset[3:]}"  # +0530 -> +05:30
@@ -171,34 +202,42 @@ def build_calendar_tools(
         def day(d: datetime) -> str:
             return f"{d.strftime('%A')} {d.date().isoformat()}"
 
-        # Relative dates are precomputed: models routinely get this arithmetic
-        # wrong (reporting today's date as "tomorrow"), and a wrong date silently
-        # creates the event on the wrong day.
         return (
             f"Current local time: {now.strftime('%Y-%m-%dT%H:%M:%S')}{offset} "
             f"({now.tzname()}, UTC{offset}).\n"
             f"TODAY is {day(now)}.\n"
             f"TOMORROW is {day(now + timedelta(days=1))}.\n"
             f"YESTERDAY was {day(now - timedelta(days=1))}.\n"
-            f"Use these dates exactly as given. Always append the offset "
-            f"{offset} to timestamps you send to other tools."
+            f"Use these dates exactly as given. Always append offset "
+            f"{offset} to timestamps sent to tools."
         )
 
     @tool
     async def list_events(
-        time_min: str | None = None, time_max: str | None = None, max_results: int = 10
+        period: str | None = None,
+        time_min: str | None = None,
+        time_max: str | None = None,
+        max_results: int = 10,
     ) -> str:
-        """List calendar events in a time range.
-
-        ``time_min``/``time_max`` are ISO 8601 strings; if ``time_min`` is
-        omitted the current time is used. Returns upcoming events when
-        ``time_max`` is omitted.
-        """
-        try:
-            start = parse_iso8601(time_min, default_tz=user_tz) if time_min else datetime.now(user_tz)
-            end = parse_iso8601(time_max, default_tz=user_tz) if time_max else None
-        except ValueError as exc:
-            return f"Invalid date/time: {exc}. Use ISO 8601, e.g. 2026-07-20T09:00:00Z."
+        """List calendar events. Prefer period ('today', 'tomorrow', 'this_week', 'next_week'). Otherwise pass ISO 8601 time_min/time_max."""
+        if period is not None:
+            window = _resolve_period(period, user_tz)
+            if window is None:
+                return (
+                    f"Unknown period {period!r}. Use one of: "
+                    f"{', '.join(_PERIOD_CHOICES)}, or pass time_min/time_max."
+                )
+            start, end = window
+        else:
+            try:
+                start = (
+                    parse_iso8601(time_min, default_tz=user_tz)
+                    if time_min
+                    else datetime.now(user_tz)
+                )
+                end = parse_iso8601(time_max, default_tz=user_tz) if time_max else None
+            except ValueError as exc:
+                return f"Invalid date/time: {exc}. Use ISO 8601, e.g. 2026-07-20T09:00:00Z."
         capped = max(1, min(max_results, default_max_results * 5))
         try:
             events = await gateway.list_events(time_min=start, time_max=end, max_results=capped)
@@ -209,10 +248,7 @@ def build_calendar_tools(
 
     @tool
     async def check_availability(time_min: str, time_max: str) -> str:
-        """Check whether a time frame is free, or list conflicting busy intervals.
-
-        Both bounds are ISO 8601 strings.
-        """
+        """Check if time range is free or list busy intervals. Arguments are ISO 8601 strings."""
         try:
             start = parse_iso8601(time_min, default_tz=user_tz)
             end = parse_iso8601(time_max, default_tz=user_tz)
@@ -222,8 +258,6 @@ def build_calendar_tools(
             return "The end time must be after the start time."
         try:
             busy = await gateway.check_availability(time_min=start, time_max=end)
-            # Free/busy alone misses events shown as "Free" or declined, so the
-            # window's actual events are checked too.
             overlapping = await gateway.list_events(
                 time_min=start, time_max=end, max_results=50
             )
@@ -240,7 +274,7 @@ def build_calendar_tools(
         location: str | None = None,
         description: str | None = None,
     ) -> str:
-        """Create a calendar event. Start and end are ISO 8601 strings."""
+        """Create a calendar event. start/end are ISO 8601 strings."""
         try:
             start_dt = parse_iso8601(start, default_tz=user_tz)
             end_dt = parse_iso8601(end, default_tz=user_tz)
@@ -263,12 +297,7 @@ def build_calendar_tools(
 
     @tool(args_schema=DeleteEventInput)
     async def delete_event(summary: str, start: str) -> str:
-        """Delete a calendar event, identified by its title and start time.
-
-        Deletion is permanent. The event is located by searching the day of
-        ``start``; the request is refused rather than guessed if the title and
-        time do not identify exactly one event.
-        """
+        """Permanently delete a calendar event by exact title and start time (ISO 8601)."""
         try:
             target = parse_iso8601(start, default_tz=user_tz)
         except ValueError as exc:
