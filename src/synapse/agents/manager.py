@@ -97,6 +97,7 @@ def default_worker_specs(settings: Settings) -> list[WorkerSpec]:
             at least one worker to delegate to).
     """
     enabled = settings.enabled_worker_names()
+    logger.info("worker_roster_requested", enabled_workers=enabled)
     specs = [
         _WORKER_BUILDERS[name](settings)
         for name in _WORKER_BUILDERS
@@ -107,6 +108,7 @@ def default_worker_specs(settings: Settings) -> list[WorkerSpec]:
             "No workers are enabled. Set SYNAPSE_ENABLED_WORKERS to at least one "
             f"of: {', '.join(_WORKER_BUILDERS)}."
         )
+    logger.info("worker_roster_resolved", workers=[spec.name for spec in specs])
     return specs
 
 
