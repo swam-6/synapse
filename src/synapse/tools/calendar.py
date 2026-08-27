@@ -238,6 +238,32 @@ def build_calendar_tools(
                 end = parse_iso8601(time_max, default_tz=user_tz) if time_max else None
             except ValueError as exc:
                 return f"Invalid date/time: {exc}. Use ISO 8601, e.g. 2026-07-20T09:00:00Z."
+        """List calendar events.
+
+        PREFER ``period`` for a named span — "today", "tomorrow", "yesterday",
+        "this_week", "next_week". It is resolved in the user's timezone, so you
+        need no date arithmetic and no get_current_datetime call. Otherwise pass
+        ISO 8601 ``time_min``/``time_max``; omitting ``time_min`` starts at the
+        current moment and hides anything earlier that day.
+        """
+        if period is not None:
+            window = _resolve_period(period, user_tz)
+            if window is None:
+                return (
+                    f"Unknown period {period!r}. Use one of: "
+                    f"{', '.join(_PERIOD_CHOICES)}, or pass time_min/time_max."
+                )
+            start, end = window
+        else:
+            try:
+                start = (
+                    parse_iso8601(time_min, default_tz=user_tz)
+                    if time_min
+                    else datetime.now(user_tz)
+                )
+                end = parse_iso8601(time_max, default_tz=user_tz) if time_max else None
+            except ValueError as exc:
+                return f"Invalid date/time: {exc}. Use ISO 8601, e.g. 2026-07-20T09:00:00Z."
         capped = max(1, min(max_results, default_max_results * 5))
         try:
             events = await gateway.list_events(time_min=start, time_max=end, max_results=capped)
@@ -298,6 +324,11 @@ def build_calendar_tools(
     @tool(args_schema=DeleteEventInput)
     async def delete_event(summary: str, start: str) -> str:
         """Permanently delete a calendar event by exact title and start time (ISO 8601)."""
+        """Permanently delete a calendar event by its title and start time.
+
+        The event is looked up on the day of ``start``; if the title and time do
+        not identify exactly one event the request is refused, never guessed.
+        """
         try:
             target = parse_iso8601(start, default_tz=user_tz)
         except ValueError as exc:
